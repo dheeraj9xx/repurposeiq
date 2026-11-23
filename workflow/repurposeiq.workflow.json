@@ -1,0 +1,382 @@
+{
+  "name": "RepurposeIQ: one source to 7 reviewed drafts",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "RepurposeIQ: submit a source",
+        "formDescription": "Paste a published Substack post. RepurposeIQ pulls the text, drafts 7 channel formats from the exact source sentences, checks every number against the source, then hands the drafts to a human editor for review. No AI model is used.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Source URL",
+              "placeholder": "https://dheeraj9xx.substack.com/p/...",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "CTA link",
+              "placeholder": "Optional. Defaults to the source URL"
+            },
+            {
+              "fieldLabel": "Editor name",
+              "placeholder": "Who will review the drafts",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "path": "repurposeiq",
+          "buttonLabel": "Draft 7 formats"
+        }
+      },
+      "id": "riq-1",
+      "name": "Submit a source",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "repurposeiq-source-form"
+    },
+    {
+      "parameters": {
+        "jsCode": "const url = String($json['Source URL'] || '').trim();\nconst m = url.match(/^https?:\\/\\/([^/]+)\\/p\\/([^/?#]+)/);\nif (!m) throw new Error('Please submit a Substack post URL like https://name.substack.com/p/slug');\nreturn [{ json: { sourceUrl: url, apiUrl: 'https://' + m[1] + '/api/v1/posts/' + m[2], cta: String($json['CTA link'] || '').trim(), editor: $json['Editor name'] } }];"
+      },
+      "id": "riq-2",
+      "name": "Resolve Substack API URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.apiUrl }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "riq-3",
+      "name": "Fetch the source",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function cleanAndSplit(post) {\n  const html = post.body_html || '';\n  const text = html\n    .replace(/<(script|style|figure|figcaption)[\\s\\S]*?<\\/\\1>/gi, ' ')\n    .replace(/<\\/(p|h[1-6]|li|blockquote)>/gi, '\\n')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8217;|&rsquo;/g, \"'\")\n    .replace(/&#8220;|&#8221;|&ldquo;|&rdquo;|&quot;/g, '\"').replace(/&#8212;|&mdash;/g, ', ')\n    .replace(/&#8211;|&ndash;/g, ' to ').replace(/&#\\d+;/g, ' ')\n    .replace(/[ \\t]+/g, ' ');\n  const paras = text.split('\\n').map(s => s.trim()).filter(s => s.length > 40);\n  const passages = [];\n  if (post.title) passages.push({ id: 'T', para: 0, text: post.title.trim() });\n  if (post.subtitle) passages.push({ id: 'P00', para: 0, text: post.subtitle.trim() });\n  paras.forEach((p, pi) => {\n    const sents = p.split(/(?<=[.!?][\"')\\]]?)\\s+(?=[A-Z0-9\"'(])/);\n    sents.map(s => s.trim()).filter(s => s.length > 25 && !/https?:\\/\\/|^Sources?:/i.test(s)).forEach(s => {\n      passages.push({ id: 'P' + String(passages.length + 1).padStart(2, '0'), para: pi + 1, text: s });\n    });\n  });\n  return {\n    title: post.title, subtitle: post.subtitle || '', url: post.canonical_url,\n    published: post.post_date, wordCount: text.split(/\\s+/).filter(Boolean).length,\n    passages,\n  };\n}\n\nconst doc = cleanAndSplit($json);\nif (doc.passages.length < 5) throw new Error('The source is too short to repurpose');\nreturn [{ json: doc }];"
+      },
+      "id": "riq-4",
+      "name": "Clean and split into passages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const NUM_RE = /(?:[$₹€£]\\s?)?\\d[\\d,]*(?:\\.\\d+)?\\s?(?:%|x|million|billion|thousand|k|M|B)?/gi;\nfunction extractClaims(doc) {\n  const claims = [];\n  for (const p of doc.passages) {\n    const nums = (p.text.match(NUM_RE) || []).map(n => n.trim()).filter(n => /\\d/.test(n) && !/^(19|20)\\d{2}$/.test(n.replace(/,/g, '')));\n    if (nums.length) claims.push({ passage: p.id, numbers: nums, sentence: p.text });\n  }\n  // score passages: claims, named sources, contrast words, position\n  const scored = doc.passages.filter(p => p.id !== 'T').map((p, i) => {\n    let s = 0;\n    if (claims.find(c => c.passage === p.id)) s += 3;\n    if (/\\b(study|report|analy[sz]ed|data|found|survey|research|according)\\b/i.test(p.text)) s += 2;\n    if (/\\b(but|instead|not|stopped|never|only|now)\\b/i.test(p.text)) s += 1;\n    if (i < 4) s += 1;\n    if (p.text.length > 260) s -= 1;\n    if (p.text.length < 70) s -= 2;\n    if (p.id === 'P00') s += 2;\n    return { ...p, score: s };\n  }).sort((a, b) => b.score - a.score);\n  return { claims, ranked: scored };\n}\n\nconst ex = extractClaims($json);\nreturn [{ json: { doc: $json, claims: ex.claims, ranked: ex.ranked.slice(0, 12) } }];"
+      },
+      "id": "riq-5",
+      "name": "Extract claims and rank passages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function draftFormats(doc, ex, opts) {\n  const top = ex.ranked.slice(0, 8);\n  const byId = id => doc.passages.find(p => p.id === id);\n  const keyClaim = ex.ranked.find(p => ex.claims.find(c => c.passage === p.id)) || top[0];\n  const takeaways = top.filter(p => p.id !== keyClaim.id).slice(0, 4);\n  const cta = opts.cta || doc.url;\n  const src = list => list.map(p => p.id);\n  const drafts = [];\n  drafts.push({ format: 'LinkedIn post', sources: src([keyClaim, ...takeaways.slice(0, 3)]), text:\n    `${doc.title}\\n\\n${keyClaim.text}\\n\\n` + takeaways.slice(0, 3).map(t => `• ${t.text}`).join('\\n') +\n    `\\n\\nFull breakdown: ${cta}` });\n  drafts.push({ format: 'X thread', sources: src([keyClaim, ...takeaways]), text:\n    [`1/ ${doc.title}`, `2/ ${keyClaim.text}`, ...takeaways.slice(0, 3).map((t, i) => `${i + 3}/ ${t.text}`), `${takeaways.slice(0, 3).length + 3}/ Read it here: ${cta}`].join('\\n\\n') });\n  drafts.push({ format: 'Newsletter teaser', sources: src([keyClaim]), text:\n    `${doc.subtitle || keyClaim.text}\\n\\nThe detail worth your two minutes: ${keyClaim.text}\\n\\nRead the issue: ${cta}` });\n  drafts.push({ format: 'Carousel outline (6 slides)', sources: src([keyClaim, ...takeaways]), text:\n    [`Slide 1 (hook): ${doc.title}`, `Slide 2 (the evidence): ${keyClaim.text}`, ...takeaways.slice(0, 3).map((t, i) => `Slide ${i + 3}: ${t.text}`), `Slide 6 (CTA): Full issue at ${cta}`].join('\\n') });\n  drafts.push({ format: 'Short video script (45s)', sources: src([keyClaim, takeaways[0]]), text:\n    `[0-3s HOOK] ${doc.title}\\n[3-15s] ${keyClaim.text}\\n[15-35s] ${takeaways[0] ? takeaways[0].text : ''}\\n[35-45s CTA] Link in the caption.` });\n  drafts.push({ format: 'Sales follow-up email', sources: src([keyClaim, takeaways[0]]), text:\n    `Subject: ${doc.title}\\n\\nHi {{first_name}},\\n\\nThought this was relevant to what we discussed: ${keyClaim.text}\\n\\n${takeaways[0] ? takeaways[0].text : ''}\\n\\nWorth 15 minutes to look at how this applies to you?\\n\\n${cta}` });\n  drafts.push({ format: 'Quote cards (3)', sources: src([keyClaim, ...takeaways.slice(0, 2)]), text:\n    [keyClaim, ...takeaways.slice(0, 2)].map((p, i) => `Card ${i + 1}: \"${p.text}\"`).join('\\n') });\n  return drafts.map(d => ({ ...d, status: 'Needs review', chars: d.text.length, sourceText: d.sources.map(id => byId(id)?.text) }));\n}\n\nconst meta = $('Resolve Substack API URL').first().json;\nconst drafts = draftFormats($json.doc, { claims: $json.claims, ranked: $json.ranked }, { cta: meta.cta });\nreturn [{ json: { doc: $json.doc, claims: $json.claims, drafts } }];"
+      },
+      "id": "riq-6",
+      "name": "Draft 7 formats from source sentences",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const NUM_RE = /(?:[$₹€£]\\s?)?\\d[\\d,]*(?:\\.\\d+)?\\s?(?:%|x|million|billion|thousand|k|M|B)?/gi;\nconst TEMPLATE_RE = /https?:\\/\\/\\S+|\\{\\{[^}]+\\}\\}|\\[\\d+-\\d+s[^\\]]*\\]|^\\d+\\/|Slide \\d+|Card \\d+|\\(\\d+ slides\\)|\\(\\d+s\\)|\\(3\\)|Worth 15 minutes/gm;\nfunction words(x) { return x.toLowerCase().replace(/[^a-z0-9%.,$ ]/g, ' ').split(/\\s+/).filter(Boolean); }\nfunction checkText(text, passages) {\n  const clean = text.replace(TEMPLATE_RE, ' ');\n  const nums = (clean.match(NUM_RE) || []).map(n => n.trim()).filter(n => /\\d/.test(n));\n  const issues = [];\n  const lines = clean.split(/\\n+|(?<=[.!?])\\s+/).map(l => l.replace(/^[^:\\n]{0,60}:\\s+/, '').replace(/^[•\"\\s]+|[\"\\s]+$/g, ''));\n  for (const n of [...new Set(nums)]) {\n    const homes = passages.filter(p => p.text.includes(n));\n    if (!homes.length) { issues.push('\"' + n + '\" is not in the source'); continue; }\n    const line = lines.find(l => l.includes(n)) || '';\n    const lw = new Set(words(line));\n    const lwa = [...lw];\n    const best = Math.max(...homes.map(h => { const hw = new Set(words(h.text)); return lwa.filter(w => hw.has(w)).length / Math.max(1, lwa.length); }));\n    if (best < 0.85) issues.push('\"' + n + '\" appears with different wording than its source sentence');\n  }\n  return { numbersChecked: [...new Set(nums)].length, issues };\n}\n\nconst doc = $json.doc;\nconst esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\nconst drafts = $json.drafts.map(d => { const r = checkText(d.text, doc.passages); return { ...d, ...r, claimCheck: r.issues.length ? 'FLAGGED' : 'PASS' }; });\nconst summary = '<p><b>' + esc(doc.title) + '</b><br>' + doc.passages.length + ' source passages, ' + $json.claims.length + ' sentences with numbers.</p>' +\n  '<p>Automatic claim check: ' + drafts.filter(d => d.claimCheck === 'PASS').length + ' of ' + drafts.length + ' drafts pass. Every number is matched to its original source sentence. Edit any draft below; your edits are checked again before anything is saved.</p>';\nconst fields = [{ fieldType: 'html', html: summary }];\nfor (const d of drafts) fields.push({ fieldLabel: d.format + ' [' + d.claimCheck + '] sources ' + d.sources.join(', '), fieldType: 'textarea', defaultValue: d.text });\nfields.push({ fieldLabel: 'Editorial decision', fieldType: 'radio', requiredField: true, fieldOptions: { values: [{ option: 'Approve drafts that pass' }, { option: 'Send all back for rework' }] } });\nfields.push({ fieldLabel: 'Review notes', fieldType: 'textarea' });\nreturn [{ json: { doc: { title: doc.title, url: doc.url, published: doc.published, wordCount: doc.wordCount, passages: doc.passages }, drafts, reviewFields: fields } }];"
+      },
+      "id": "riq-7",
+      "name": "Claim check and build review form",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "defineForm": "json",
+        "jsonOutput": "={{ JSON.stringify($json.reviewFields) }}",
+        "options": {
+          "formTitle": "Editorial review",
+          "formDescription": "Read each draft against its source sentences, edit if needed, then decide.",
+          "buttonLabel": "Submit review"
+        }
+      },
+      "id": "riq-8",
+      "name": "Editorial review (human)",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        0
+      ],
+      "webhookId": "repurposeiq-review-form"
+    },
+    {
+      "parameters": {
+        "jsCode": "const NUM_RE = /(?:[$₹€£]\\s?)?\\d[\\d,]*(?:\\.\\d+)?\\s?(?:%|x|million|billion|thousand|k|M|B)?/gi;\nconst TEMPLATE_RE = /https?:\\/\\/\\S+|\\{\\{[^}]+\\}\\}|\\[\\d+-\\d+s[^\\]]*\\]|^\\d+\\/|Slide \\d+|Card \\d+|\\(\\d+ slides\\)|\\(\\d+s\\)|\\(3\\)|Worth 15 minutes/gm;\nfunction words(x) { return x.toLowerCase().replace(/[^a-z0-9%.,$ ]/g, ' ').split(/\\s+/).filter(Boolean); }\nfunction checkText(text, passages) {\n  const clean = text.replace(TEMPLATE_RE, ' ');\n  const nums = (clean.match(NUM_RE) || []).map(n => n.trim()).filter(n => /\\d/.test(n));\n  const issues = [];\n  const lines = clean.split(/\\n+|(?<=[.!?])\\s+/).map(l => l.replace(/^[^:\\n]{0,60}:\\s+/, '').replace(/^[•\"\\s]+|[\"\\s]+$/g, ''));\n  for (const n of [...new Set(nums)]) {\n    const homes = passages.filter(p => p.text.includes(n));\n    if (!homes.length) { issues.push('\"' + n + '\" is not in the source'); continue; }\n    const line = lines.find(l => l.includes(n)) || '';\n    const lw = new Set(words(line));\n    const lwa = [...lw];\n    const best = Math.max(...homes.map(h => { const hw = new Set(words(h.text)); return lwa.filter(w => hw.has(w)).length / Math.max(1, lwa.length); }));\n    if (best < 0.85) issues.push('\"' + n + '\" appears with different wording than its source sentence');\n  }\n  return { numbersChecked: [...new Set(nums)].length, issues };\n}\n\nconst prev = $('Claim check and build review form').first().json;\nconst meta = $('Resolve Substack API URL').first().json;\nconst review = $json;\nconst decision = review['Editorial decision'];\nconst results = prev.drafts.map(d => {\n  const key = Object.keys(review).find(k => k.startsWith(d.format + ' ['));\n  const finalText = key && review[key] ? String(review[key]) : d.text;\n  const norm = x => String(x).split(String.fromCharCode(13)).join('').split(String.fromCharCode(10)).map(l => l.trimEnd()).join(' ').trim();\n  const edited = norm(finalText) !== norm(d.text);\n  const r = checkText(finalText, prev.doc.passages);\n  const status = decision.startsWith('Send') ? 'Sent back' : (r.issues.length ? 'Blocked: claim check failed' : 'Approved');\n  return { format: d.format, sources: d.sources, edited, numbersChecked: r.numbersChecked, issues: r.issues, status, text: finalText };\n});\nconst runAt = new Date().toISOString();\nconst counts = { approved: results.filter(r => r.status === 'Approved').length, blocked: results.filter(r => r.status.startsWith('Blocked')).length, edited: results.filter(r => r.edited).length };\nlet md = '# RepurposeIQ run\\n\\nSource: ' + prev.doc.title + '\\n' + prev.doc.url + '\\n\\nRun: ' + runAt + ' | Execution ' + $execution.id + ' | Editor: ' + meta.editor + ' | Decision: ' + decision + '\\n\\nApproved ' + counts.approved + ', blocked ' + counts.blocked + ', edited ' + counts.edited + ' of ' + results.length + '\\n';\nfor (const r of results) md += '\\n## ' + r.format + ' (' + r.status + ')\\nSources: ' + r.sources.join(', ') + (r.issues.length ? '\\nIssues: ' + r.issues.join('; ') : '') + '\\n\\n' + r.text + '\\n';\nmd += '\\n## Review notes\\n' + (review['Review notes'] || 'None') + '\\n';\nconst summaryText = 'Approved ' + counts.approved + ' of ' + results.length + ' drafts. ' + (counts.blocked ? counts.blocked + ' blocked by the claim check after editing. ' : '') + 'Saved as run-' + $execution.id + '.';\nreturn [{ json: { runAt, execution: $execution.id, source: { title: prev.doc.title, url: prev.doc.url }, editor: meta.editor, decision, notes: review['Review notes'] || '', counts, results, markdown: md, summaryText } }];"
+      },
+      "id": "riq-9",
+      "name": "Re-check edits and package results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "markdown",
+        "options": {
+          "fileName": "={{ \"run-\" + $json.execution + \".md\" }}"
+        }
+      },
+      "id": "riq-10",
+      "name": "Markdown file",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ \"/Users/dheerajsingh/riq-n8n/output/run-\" + $(\"Re-check edits and package results\").first().json.execution + \".md\" }}",
+        "options": {}
+      },
+      "id": "riq-11",
+      "name": "Save markdown",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2200,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toJson",
+        "mode": "once",
+        "options": {
+          "fileName": "={{ \"run-\" + $json.execution + \".json\" }}"
+        }
+      },
+      "id": "riq-12",
+      "name": "JSON file",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ \"/Users/dheerajsingh/riq-n8n/output/run-\" + $(\"Re-check edits and package results\").first().json.execution + \".json\" }}",
+        "options": {}
+      },
+      "id": "riq-13",
+      "name": "Save JSON",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        2200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "Review saved",
+        "completionMessage": "={{ $(\"Re-check edits and package results\").first().json.summaryText }}",
+        "options": {}
+      },
+      "id": "riq-14",
+      "name": "Done",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        -120
+      ],
+      "webhookId": "repurposeiq-done"
+    }
+  ],
+  "connections": {
+    "Submit a source": {
+      "main": [
+        [
+          {
+            "node": "Resolve Substack API URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Substack API URL": {
+      "main": [
+        [
+          {
+            "node": "Fetch the source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch the source": {
+      "main": [
+        [
+          {
+            "node": "Clean and split into passages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean and split into passages": {
+      "main": [
+        [
+          {
+            "node": "Extract claims and rank passages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract claims and rank passages": {
+      "main": [
+        [
+          {
+            "node": "Draft 7 formats from source sentences",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft 7 formats from source sentences": {
+      "main": [
+        [
+          {
+            "node": "Claim check and build review form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim check and build review form": {
+      "main": [
+        [
+          {
+            "node": "Editorial review (human)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Editorial review (human)": {
+      "main": [
+        [
+          {
+            "node": "Re-check edits and package results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-check edits and package results": {
+      "main": [
+        [
+          {
+            "node": "Markdown file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "JSON file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Markdown file": {
+      "main": [
+        [
+          {
+            "node": "Save markdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JSON file": {
+      "main": [
+        [
+          {
+            "node": "Save JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save markdown": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  }
+}
